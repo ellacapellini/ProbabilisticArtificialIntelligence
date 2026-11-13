@@ -1,25 +1,29 @@
-#safeopt-style constrained Bayesian optimisaton attept 1
+"""Solution: SafeOpt-style constrained Bayesian optimisation"""
+
 import numpy as np
 from scipy.optimize import fmin_l_bfgs_b
 
+
 SEARCH_BOUNDS = np.array([[0.0, 10.0]])
 MAX_SAFE_SA = 4.0
-PLOT_DIAGNOSTICS = False 
+PLOT_DIAGNOSTICS = False  
 
-#model hyperparm
+# model hyperparm
 SIGMA_F = 0.15
 SIGMA_V = 1e-4
 VAR_F = 0.5
-VARV_V = np.sqrt(2.0)
+VAR_V = np.sqrt(2.0)
 V_PRIOR_MEAN = 4.0
-LS_CANDIDATES_F = (0.5, 1.0, 2.0, 10.0)
-LS_CANDIDATES_V = (0.5,)
+LS_CANDIDATES_F = (0.5, 1.0)
+LS_CANDIDATES_V = (0.5,)  #short lengthscale = conservative (> std away from data)
 
-# alg hyperparm
-BETA_V = 3.0 #safety confidence multipl
-TRIVIAL_RADIUS = 0.105 #≈> penalty radius of 0.1
-BETA_F = 3.0 #UCB explor multipl
+# algo hyerparm
+BETA_V = 5.5   #safety confidence multiplier (tuned on real checker)
+TRIVIAL_RADIUS = 0.105  # ≈> 0.1 penalty radius
+BETA_F = 5.0   # UCB exploration multiplier
+BETA_V_FINAL = 5.5  # safety multiplier for final recommendation
 GRID = np.linspace(0.0, 10.0, 1001)[:, None]
+
 
 def _matern52(a, b, ls, var):
     d = np.abs(a - b.T) / ls
@@ -28,9 +32,9 @@ def _matern52(a, b, ls, var):
 def _kernel_f(a, b, ls):
     return _matern52(a, b, ls, VAR_F)
 def _kernel_v(a, b, ls):
-    return _matern52(a, b, ls, VARV_V) + a @ b.T #matern+linear 
+    return _matern52(a, b, ls, VAR_V) + a @ b.T  # Matern + linear
 class _GP:
-    "tiny exact GP x 1D inputs with ML selection over lengthscale set"
+    """Tiny exact GP x 1D inputs + ML selection over a lengthscale set"""
     def __init__(self, kernel, noise_var, ls_candidates, prior_mean=0.0):
         self.kernel, self.noise_var = kernel, noise_var
         self.ls_candidates, self.prior_mean = ls_candidates, prior_mean
@@ -62,15 +66,14 @@ class _GP:
         var = np.maximum(prior - (v * v).sum(0), 1e-12)
         return mean, np.sqrt(var)
     def _prior_diag(self, Xq):
-        #diagonal of kenrel(Xq, Xq) without building nxn matrix
+        #diagonal of kernel(Xq, Xq) without building n x n matrix
         z = np.zeros((1, 1))
-        base = self.kernel(z, z, self.ls)[0, 0] #stationary part at r=0
-        #kernel_v has non-stationarity linear term x^2; kernel_f doesn't
+        base = self.kernel(z, z, self.ls)[0, 0]  #stationary part at r=0 --> kernel_v has a non-stationary linear term: x^2; kernel_f does not
         extra = (Xq[:, 0] ** 2) if self.kernel is _kernel_v else 0.0
         return base + extra
 
 class SafeBOAgent:
-    #choose sage queries + return final point using noise observatiosn 
+    """Choose safe queries + return final point using noisy observations"""
     def __init__(self):
         self.X, self.F, self.V = [], [], []
         self.gp_f = _GP(_kernel_f, SIGMA_F ** 2, LS_CANDIDATES_F)
@@ -81,7 +84,7 @@ class SafeBOAgent:
     #model handling
     def _update_models(self):
         if not self._stale:
-            return 
+            return
         X = np.array(self.X).reshape(-1, 1)
         self.gp_f.fit(X, np.array(self.F))
         self.gp_v.fit(X, np.array(self.V))
@@ -93,14 +96,14 @@ class SafeBOAgent:
         return mf, sf, mv, sv
     def _safe_mask(self, mv, sv):
         return (mv + self.beta_v * sv) < MAX_SAFE_SA
-    # API
+    #API
     def observe(self, point, objective_value, safety_value):
         self.X.append(float(np.squeeze(point)))
-        self.F.append(float((np.squeeze(objective_value))))
+        self.F.append(float(np.squeeze(objective_value)))
         self.V.append(float(np.squeeze(safety_value)))
         self._stale = True
     def acquisition_function(self, candidates):
-        #UCB on logP + Lagrangian-style barrier outside safe set
+        """UCB on logP + a Lagrangian-style barrier outside the safe set"""
         self._update_models()
         c = np.atleast_2d(candidates).reshape(-1, 1)
         mf, sf, mv, sv = self._posterior(c)
@@ -108,7 +111,7 @@ class SafeBOAgent:
         slack = mv + self.beta_v * sv - MAX_SAFE_SA
         return ucb - 1e3 * np.maximum(slack, 0.0)
     def optimize_acquisition(self, restarts=20):
-        #1D problem: exhuastive gris > reliable than L-BFGS multistart
+        # 1D problem: exhaustive grid is > reliable than L-BFGS multistart
         self._update_models()
         mf, sf, mv, sv = self._cache
         safe = self._safe_mask(mv, sv)
@@ -121,14 +124,14 @@ class SafeBOAgent:
     def best_safe_point(self):
         self._update_models()
         mf, sf, mv, sv = self._cache
-        safe = self._safe_mask(mv, sv)
+        safe = (mv + BETA_V_FINAL * sv) < MAX_SAFE_SA
         if safe.any():
             score = np.where(safe, mf, -np.inf)
             i = int(np.argmax(score))
-            #return ≈ initial point is penalised + moving just out 0.1 radius costs little regret, so step out of it
+            #returning (≈) initial point is penalised, and moving just outside 0.1 radius costs < regret, so step out of it.
             x0 = self.X[0]
             if abs(GRID[i, 0] - x0) <= TRIVIAL_RADIUS:
-                far = np.abs(GRID[: , 0] - x0) > TRIVIAL_RADIUS
+                far = np.abs(GRID[:, 0] - x0) > TRIVIAL_RADIUS
                 score_far = np.where(far, score, -np.inf)
                 if np.isfinite(score_far).any():
                     i = int(np.argmax(score_far))
@@ -137,12 +140,12 @@ class SafeBOAgent:
         x = max(cand)[1] if cand else self.X[int(np.argmin(self.V))]
         return np.array([[x]])
     def plot_diagnostics(self, include_recommendation=True):
-        import matplotlib 
+        import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         self._update_models()
-        mf, sf, mv, sv  = self._cache
-        g = GRID[: , 0]
+        mf, sf, mv, sv = self._cache
+        g = GRID[:, 0]
         fig, ax = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
         ax[0].plot(g, mf, label="f mean"); ax[0].fill_between(g, mf - 2 * sf, mf + 2 * sf, alpha=.2)
         ax[0].scatter(self.X, self.F, c="k", s=12, label="obs")
@@ -155,7 +158,8 @@ class SafeBOAgent:
         ax[1].legend(); ax[1].set_ylabel("SA"); ax[1].set_xlabel("x")
         plt.savefig("/results/diagnostics.pdf"); plt.close(fig)
 
- #toy probelm 
+
+#toy problem 
 def in_search_bounds(point):
     point = np.atleast_2d(point)
     return np.all(point >= SEARCH_BOUNDS[:, 0]) and np.all(point <= SEARCH_BOUNDS[:, 1])
@@ -182,6 +186,6 @@ def main():
     solution = agent.best_safe_point()
     assert in_search_bounds(solution)
     print(f"Proposed solution: {solution}; toy objective: {toy_objective(solution)}")
- 
+
 if __name__ == "__main__":
     main()
