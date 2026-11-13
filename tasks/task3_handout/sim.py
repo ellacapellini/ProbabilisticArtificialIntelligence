@@ -1,6 +1,6 @@
 """Local simulator: random tasks drawn from GP priors, scored with the handout formula."""
 import sys, importlib, numpy as np
-import solution as S
+import solution_professor_original as S
 
 G = np.linspace(0, 10, 1001)
 
